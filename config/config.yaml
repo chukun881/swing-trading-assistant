@@ -24,17 +24,18 @@ exit:
   take_profit_rsi: 75
   trailing_stop_enabled: false
 
-# 市场配置
+# 市场配置（仅支持美国市场）
 markets:
   us:
     exchanges: ["NASDAQ", "NYSE", "AMEX"]
     min_volume: 1000000
-  malaysia:
-    exchanges: ["BURSA"]
-    min_volume: 500000
 
 # 其他配置
 log_level: INFO
 
 # 股票扫描配置
-max_stocks_per_market: 300  # 每个市场扫描的最大股票数量
+max_stocks: 300  # 扫描的最大股票数量
+
+# VIX 市场过滤器
+market_filter:
+  vix_threshold: 30.0  # VIX > 30 时暂停交易

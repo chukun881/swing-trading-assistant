@@ -91,10 +91,10 @@ def scan_for_signals(config: Dict, telegram_notifier) -> List[Dict]:
     logger.info("Starting market scan...")
     start_time = time.time()
     
-    # 获取股票数据
-    max_stocks = config.get('max_stocks_per_market', 300)
-    stocks = get_stock_list_with_data(config, max_stocks_per_market=max_stocks)
-    logger.info(f"Retrieved data for {len(stocks)} stocks")
+    # 获取股票数据（仅美国市场）
+    max_stocks = config.get('max_stocks', 300)
+    stocks = get_stock_list_with_data(config, max_stocks=max_stocks)
+    logger.info(f"Retrieved data for {len(stocks)} US stocks")
     
     # 分析每只股票
     for stock in stocks:

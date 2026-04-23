@@ -60,160 +60,60 @@ class IBKRCommission(bt.CommissionInfo):
 
 
 # ============================================================================
-# 指标类
-# ============================================================================
-
-class EMA(bt.indicators.EMA):
-    """指数移动平均线"""
-    pass
-
-
-class RSI(bt.indicators.RSI):
-    """相对强弱指标"""
-    pass
-
-
-class BollingerBands(bt.indicators.BollingerBands):
-    """布林带"""
-    pass
-
-
-class VolumeSMA(bt.indicators.SMA):
-    """成交量移动平均线"""
-    pass
-
-
-# ============================================================================
-# 自定义指标
-# ============================================================================
-
-class CandlestickPattern(bt.Indicator):
-    """
-    K线形态检测
-    
-    检测形态：
-    - 锤子线 (Hammer)
-    - 十字星 (Doji)
-    - 吞没阳线 (Bullish Engulfing)
-    """
-    lines = ('hammer', 'doji', 'bullish_engulfing')
-    params = (
-        ('hammer_body_ratio', 0.3),      # 实体占影线比例
-        ('doji_body_ratio', 0.1),        # 十字星实体比例
-    )
-    plotinfo = dict(plot=False)
-    
-    def __init__(self):
-        # 获取 OHLC 数据
-        self.o = self.data.open
-        self.h = self.data.high
-        self.l = self.data.low
-        self.c = self.data.close
-        
-        # 前一日数据
-        self.o1 = self.data.open(-1)
-        self.h1 = self.data.high(-1)
-        self.l1 = self.data.low(-1)
-        self.c1 = self.data.close(-1)
-        
-        # 计算实体和影线
-        self.body = abs(self.c - self.o)
-        self.range1 = self.h - self.l
-        self.upper_shadow = bt.If(self.c >= self.o, self.h - self.o, self.h - self.c)
-        self.lower_shadow = bt.If(self.c >= self.o, self.o - self.l, self.c - self.l)
-        
-        # 前一日实体
-        self.body1 = abs(self.c1 - self.o1)
-        
-        # 锤子线：小实体 + 长下影线
-        is_bullish = self.c >= self.o
-        is_small_body = self.body <= self.range1 * self.p.hammer_body_ratio
-        is_long_lower_shadow = self.lower_shadow >= self.range1 * 0.6
-        is_short_upper_shadow = self.upper_shadow <= self.range1 * 0.2
-        
-        self.lines.hammer = bt.And(is_bullish, is_small_body, is_long_lower_shadow, is_short_upper_shadow)
-        
-        # 十字星：实体很小
-        self.lines.doji = self.body <= self.range1 * self.p.doji_body_ratio
-        
-        # 吞没阳线：今日阳线完全包住昨日阴线
-        is_bullish_today = self.c > self.o
-        is_bearish_yesterday = self.c1 < self.o1
-        is_engulf_high = self.c >= self.o1
-        is_engulf_low = self.o <= self.c1
-        
-        self.lines.bullish_engulfing = bt.And(is_bullish_today, is_bearish_yesterday, is_engulf_high, is_engulf_low)
-
-
-# ============================================================================
-# 市场环境过滤器
-# ============================================================================
-
-class MarketRegime(bt.Indicator):
-    """
-    市场环境过滤器
-    
-    基于 VIX 判断市场环境：
-    - VIX > 30：高风险，暂停信号
-    - VIX <= 30：正常，允许信号
-    """
-    lines = ('vix', 'is_safe',)
-    plotinfo = dict(plot=False)
-    params = (('vix_threshold', 30.0),)
-    
-    def __init__(self):
-        # VIX 需要从外部数据源获取
-        # 这里我们会在 Cerebro 中添加 VIX 数据
-        self.lines.vix = self.data.close  # 假设 data 是 VIX
-        self.lines.is_safe = self.lines.vix <= self.p.vix_threshold
-
-
-# ============================================================================
-# 交易策略
+# 交易策略 - 纯突破 + 移动止损 + 市场环境过滤
 # ============================================================================
 
 class SwingTradingStrategy(bt.Strategy):
     """
-    Swing Trading 策略
+    纯突破动量策略
     
-    整合 Breakout 和 Pullback 策略
+    入场：Close > BB Upper AND 60 < RSI < 80
+    
+    市场过滤：
+    - SPY Close > SMA200（牛市确认）
+    - VIX < 30（低风险环境）
+    
+    退出：
+    - 硬止损：Close < Entry_Price * 0.95
+    - 移动止损：Close < EMA20
     """
     params = (
-        # 通用参数
         ('position_size', 0.10),  # 每次交易使用 10% 资金
-        ('risk_per_trade', 0.02),  # 每次交易风险 2%
-        
-        # Breakout 参数
-        ('breakout_rsi_min', 60),
-        ('breakout_rsi_max', 75),
-        ('breakout_volume_mult', 1.5),  # 成交量倍数
-        
-        # Pullback 参数
-        ('pullback_rsi_oversold', 30),
-        ('pullback_rsi_recovery', 0.5),
-        
-        # 市场环境
-        ('vix_threshold', 30.0),
+        ('vix_threshold', 30.0),  # VIX 阈值
     )
     
     def __init__(self):
-        # 指标
-        self.ema20 = EMA(self.data, period=20)
-        self.ema50 = EMA(self.data, period=50)
-        self.rsi = RSI(self.data, period=14)
-        self.bb = BollingerBands(self.data, period=20, devfactor=2.0)
-        self.vol_sma20 = VolumeSMA(self.data.volume, period=20)
+        # 为每个数据源计算指标
+        self.indicators = {}
         
-        # K线形态
-        self.pattern = CandlestickPattern(self.data)
+        for data in self.datas:
+            if data._name in ['VIX', 'SPY']:
+                continue
+            
+            # 计算指标
+            self.indicators[data._name] = {
+                'ema20': bt.indicators.EMA(data, period=20),
+                'ema50': bt.indicators.EMA(data, period=50),
+                'rsi': bt.indicators.RSI(data, period=14),
+                'bb': bt.indicators.BollingerBands(data, period=20, devfactor=2.0),
+            }
         
-        # 市场环境（如果有 VIX 数据）
-        self.is_safe = True
-        if hasattr(self, 'vix_data'):
-            self.vix = self.vix_data.close
-            self.is_safe = self.vix <= self.p.vix_threshold
-        else:
-            logger.warning("No VIX data provided, proceeding without market filter")
+        # 获取市场数据（安全处理，因为 VIX 和 SPY 可能不存在）
+        self.vix = None
+        self.spy = None
+        self.spy_sma200 = None
+        
+        try:
+            self.vix = self.getdatabyname('VIX')
+        except KeyError:
+            logger.warning("VIX data not available, VIX filter disabled")
+        
+        try:
+            self.spy = self.getdatabyname('SPY')
+            # 计算 SPY 的 200日 SMA
+            self.spy_sma200 = bt.indicators.SMA(self.spy, period=200)
+        except KeyError:
+            logger.warning("SPY data not available, market regime filter disabled")
         
         # 交易记录
         self.trades = []
@@ -226,8 +126,8 @@ class SwingTradingStrategy(bt.Strategy):
         self.max_drawdown = 0.0
         
         # 跟踪当前持仓
-        self.entry_price = None
-        self.entry_date = None
+        self.entry_prices = {}
+        self.entry_dates = {}
         
     def next(self):
         """每个 bar 调用"""
@@ -239,175 +139,133 @@ class SwingTradingStrategy(bt.Strategy):
         if drawdown > self.max_drawdown:
             self.max_drawdown = drawdown
         
-        # 检查市场环境
-        is_market_safe = self.is_safe[0] if hasattr(self.is_safe, '__getitem__') else self.is_safe
-        if not is_market_safe:
-            # 高风险环境，不产生新信号
+        # 检查市场过滤器
+        # 1. VIX 过滤器（如果 VIX 数据可用）
+        if self.vix is not None and self.vix.close[0] > self.p.vix_threshold:
+            # VIX > 30，不产生新买入信号
             return
         
-        # 如果已持有仓位，检查退出信号
-        if self.position:
-            self.check_exit_signals()
-        else:
-            # 检查入场信号
-            self.check_entry_signals()
-    
-    def check_entry_signals(self):
-        """检查入场信号"""
-        # Breakout 策略
-        breakout_signal = self.check_breakout()
-        if breakout_signal:
-            self.enter_position('BREAKOUT', breakout_signal)
-            return
+        # 2. SPY 市场环境过滤器（如果 SPY 数据可用）
+        if self.spy is not None and self.spy_sma200 is not None:
+            if self.spy.close[0] < self.spy_sma200[0]:
+                # SPY 在 200日均线之下，熊市，不产生新买入信号
+                return
         
-        # Pullback 策略
-        pullback_signal = self.check_pullback()
-        if pullback_signal:
-            self.enter_position('PULLBACK', pullback_signal)
-            return
-    
-    def check_breakout(self):
-        """
-        Breakout 策略
+        # 收集所有买入信号
+        buy_signals = []
         
-        条件：
-        1. price > EMA50
-        2. close > upper band
-        3. 60 <= RSI <= 75
-        4. volume > 20日平均成交量 × 1.5
-        """
-        close = self.data.close[0]
-        ema50 = self.ema50[0]
-        rsi = self.rsi[0]
-        bb_upper = self.bb.top[0]
-        volume = self.data.volume[0]
-        vol_sma = self.vol_sma20[0]
-        
-        # 检查条件
-        cond1 = close > ema50
-        cond2 = close > bb_upper
-        cond3 = self.p.breakout_rsi_min <= rsi <= self.p.breakout_rsi_max
-        cond4 = volume > vol_sma * self.p.breakout_volume_mult
-        
-        if all([cond1, cond2, cond3, cond4]):
-            signal_type = 'BUY'
-            if rsi > (self.p.breakout_rsi_max - 5):  # RSI > 70
-                signal_type = 'WAIT RETEST'
+        for data in self.datas:
+            if data._name in ['VIX', 'SPY']:
+                continue
             
+            # 如果已持有该股票，检查退出信号
+            if self.getposition(data).size > 0:
+                self.check_exit_signals(data)
+                continue
+            
+            # 检测买入信号
+            signal = self.check_entry_signals(data)
+            if signal:
+                buy_signals.append(signal)
+        
+        # 如果有多个信号，按优先级排序
+        if buy_signals:
+            # 排序逻辑：按 RSI 从高到低排序（最强优先）
+            buy_signals.sort(key=lambda x: x['rsi'], reverse=True)
+            
+            # 按顺序执行买入
+            for signal in buy_signals:
+                data = signal['data']
+                
+                # 检查是否有足够现金
+                required_cash = self.broker.getvalue() * self.p.position_size
+                if self.broker.getcash() < required_cash:
+                    # 资金不足，跳过
+                    continue
+                
+                # 执行买入
+                self.enter_position(signal)
+    
+    def check_entry_signals(self, data):
+        """
+        检查入场信号 - 纯突破策略
+        
+        Breakout: Close > BB Upper AND 60 < RSI < 80
+        """
+        symbol = data._name
+        ind = self.indicators[symbol]
+        
+        close = data.close[0]
+        rsi = ind['rsi'][0]
+        bb_upper = ind['bb'].top[0]
+        
+        # Breakout 信号：Close > BB Upper AND 60 < RSI < 80
+        if close > bb_upper and 60 < rsi < 80:
             return {
-                'type': signal_type,
+                'data': data,
+                'symbol': symbol,
                 'price': close,
                 'rsi': rsi,
-                'volume_ratio': volume / vol_sma,
             }
         
         return None
     
-    def check_pullback(self):
-        """
-        Pullback 策略
-        
-        条件：
-        1. price > EMA50
-        2. EMA20 > EMA50
-        3. price <= lower band
-        4. RSI < 30
-        5. RSI 正在回升
-        6. 出现锤子线 / 十字星 / 吞没阳线（当日收红）
-        """
-        close = self.data.close[0]
-        ema20 = self.ema20[0]
-        ema50 = self.ema50[0]
-        rsi = self.rsi[0]
-        rsi_prev = self.rsi[-1]
-        bb_lower = self.bb.bot[0]
-        
-        # 检查基础条件
-        cond1 = close > ema50
-        cond2 = ema20 > ema50
-        cond3 = close <= bb_lower
-        cond4 = rsi < self.p.pullback_rsi_oversold
-        cond5 = (rsi - rsi_prev) >= self.p.pullback_rsi_recovery
-        
-        # 检查 K线形态
-        is_bullish = close > self.data.open[0]
-        has_hammer = self.pattern.hammer[0]
-        has_doji = self.pattern.doji[0]
-        has_engulfing = self.pattern.bullish_engulfing[0]
-        cond6 = is_bullish and (has_hammer or has_doji or has_engulfing)
-        
-        if all([cond1, cond2, cond3, cond4, cond5, cond6]):
-            return {
-                'type': 'BUY',
-                'price': close,
-                'rsi': rsi,
-                'pattern': 'Hammer' if has_hammer else ('Doji' if has_doji else 'Engulfing'),
-            }
-        
-        return None
-    
-    def enter_position(self, strategy, signal):
+    def enter_position(self, signal):
         """入场"""
-        if signal['type'] == 'WAIT RETEST':
-            logger.info(f"{strategy}: Wait for retest at ${signal['price']:.2f}")
-            return
+        data = signal['data']
+        symbol = signal['symbol']
         
-        # 计算仓位大小
-        equity = self.broker.getvalue()
-        position_value = equity * self.p.position_size
-        size = int(position_value / signal['price'])
+        # 使用 PercentSizer 自动计算仓位大小
+        self.buy(data=data)
         
-        if size <= 0:
-            logger.warning(f"Cannot open position: size={size}, price={signal['price']:.2f}")
-            return
+        self.entry_prices[symbol] = signal['price']
+        self.entry_dates[symbol] = data.datetime.date(0)
         
-        # 开仓
-        self.buy(size=size)
-        self.entry_price = signal['price']
-        self.entry_date = self.data.datetime.date(0)
-        
-        logger.info(f"ENTER {strategy}: {self.data._name} at ${signal['price']:.2f}, "
-                   f"size={size}, RSI={signal['rsi']:.1f}")
+        logger.info(f"ENTER BREAKOUT: {symbol} at ${signal['price']:.2f}, RSI={signal['rsi']:.1f}")
     
-    def check_exit_signals(self):
-        """检查退出信号"""
-        close = self.data.close[0]
-        rsi = self.rsi[0]
+    def check_exit_signals(self, data):
+        """
+        检查退出信号
+        
+        1. 硬止损：Close < Entry_Price * 0.95
+        2. 移动止损：Close < EMA20
+        """
+        symbol = data._name
+        ind = self.indicators[symbol]
+        
+        close = data.close[0]
+        ema20 = ind['ema20'][0]
+        entry_price = self.entry_prices.get(symbol, close)
         
         # 退出条件
         exit_reason = None
         
-        # 1. 价格跌破 EMA20
-        if close < self.ema20[0]:
-            exit_reason = "Price < EMA20"
-        
-        # 2. RSI > 75（超买）
-        elif rsi > 75:
-            exit_reason = "RSI > 75 (Overbought)"
-        
-        # 3. 止损 -5%
-        elif self.entry_price and close < self.entry_price * 0.95:
+        # 1. 硬止损 -5%
+        if close < entry_price * 0.95:
             exit_reason = "Stop Loss (-5%)"
         
-        # 4. 止盈 +10%
-        elif self.entry_price and close > self.entry_price * 1.10:
-            exit_reason = "Take Profit (+10%)"
+        # 2. 移动止损：价格跌破 EMA20
+        elif close < ema20:
+            exit_reason = "Trailing Stop (EMA20)"
         
         if exit_reason:
-            self.close_position(exit_reason)
+            self.close_position(data, exit_reason)
     
-    def close_position(self, reason):
+    def close_position(self, data, reason):
         """平仓"""
-        current_price = self.data.close[0]
+        symbol = data._name
+        current_price = data.close[0]
+        entry_price = self.entry_prices.get(symbol, current_price)
+        entry_date = self.entry_dates.get(symbol, data.datetime.date(0))
         
         # 记录交易
-        pnl = (current_price - self.entry_price) / self.entry_price
+        pnl = (current_price - entry_price) / entry_price
         
         trade_info = {
-            'symbol': self.data._name,
-            'entry_date': self.entry_date,
-            'exit_date': self.data.datetime.date(0),
-            'entry_price': self.entry_price,
+            'symbol': symbol,
+            'entry_date': entry_date,
+            'exit_date': data.datetime.date(0),
+            'entry_price': entry_price,
             'exit_price': current_price,
             'pnl_pct': pnl,
             'reason': reason,
@@ -421,13 +279,14 @@ class SwingTradingStrategy(bt.Strategy):
         else:
             self.losing_trades += 1
         
-        logger.info(f"EXIT {self.data._name} at ${current_price:.2f}, "
-                   f"PnL={pnl*100:+.2f}%, Reason={reason}")
+        logger.info(f"EXIT {symbol} at ${current_price:.2f}, PnL={pnl*100:+.2f}%, Reason={reason}")
         
         # 平仓
-        self.close()
-        self.entry_price = None
-        self.entry_date = None
+        self.close(data=data)
+        
+        # 清除记录
+        del self.entry_prices[symbol]
+        del self.entry_dates[symbol]
     
     def stop(self):
         """回测结束时调用"""
@@ -473,24 +332,22 @@ class SwingTradingStrategy(bt.Strategy):
 def get_russell1000_tickers():
     """
     获取 Russell 1000 成分股
-    
-    由于 Russell 1000 没有直接的 API，我们使用 Russell 2000 ETF (IWM)
-    的主要持仓作为替代
     """
-    # 这里我们使用一个简化的方法：获取热门的大盘股
-    # 实际应用中可以从 Wikipedia 或其他数据源获取完整列表
-    
-    # Russell 1000 主要成分股示例（前 50 只）
+    # Russell 1000 主要成分股（前 100 只）
     tickers = [
-        'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'META', 'NVDA', 'JPM',
-        'V', 'JNJ', 'WMT', 'PG', 'XOM', 'CVX', 'LLY', 'ABBV', 'PFE',
-        'MRK', 'KO', 'PEP', 'BAC', 'AVGO', 'COST', 'TMO', 'CRM',
-        'ABT', 'MCD', 'CSCO', 'DHR', 'NKE', 'ACN', 'ADBE', 'NFLX',
-        'LIN', 'WFC', 'TXN', 'ORCL', 'UNH', 'HD', 'CMCSA', 'DIS',
-        'VZ', 'INTC', 'AMD', 'IBM', 'GE', 'HON', 'BA', 'CAT'
+        'AAPL', 'MSFT', 'GOOGL', 'GOOG', 'AMZN', 'TSLA', 'META', 'NVDA', 'JPM',
+        'V', 'JNJ', 'WMT', 'PG', 'XOM', 'CVX', 'LLY', 'ABBV', 'PFE', 'MRK',
+        'KO', 'PEP', 'BAC', 'AVGO', 'COST', 'TMO', 'CRM', 'ABT', 'MCD', 'CSCO',
+        'DHR', 'NKE', 'ACN', 'ADBE', 'NFLX', 'LIN', 'WFC', 'TXN', 'ORCL', 'UNH',
+        'HD', 'CMCSA', 'VZ', 'DIS', 'INTC', 'AMD', 'IBM', 'GE', 'HON', 'BA',
+        'CAT', 'UPS', 'RTX', 'LMT', 'UNP', 'DE', 'MMM', 'EMR', 'ITW', 'ETN',
+        'CMI', 'GD', 'NOC', 'PH', 'PCAR', 'FDX', 'URI', 'DOV', 'OTIS', 'CARR',
+        'WM', 'RSG', 'CPRT', 'CTAS', 'EBAY', 'PYPL', 'ADP', 'INTU', 'NOW', 'FIS',
+        'ISRG', 'REGN', 'VRTX', 'BIIB', 'MRNA', 'EL', 'BSX', 'RMD', 'HCA', 'CI',
+        'ANTM', 'HUM', 'CNC', 'DGX', 'IQV', 'ILMN', 'DLR', 'VICI', 'SPG', 'CBRE',
     ]
     
-    logger.info(f"Using {len(tickers)} stocks for backtesting")
+    logger.info(f"Using {len(tickers)} Russell 1000 stocks for backtesting")
     return tickers
 
 
@@ -561,10 +418,61 @@ def download_vix(start_date, end_date):
     try:
         vix_ticker = '^VIX'
         vix_data = yf.download(vix_ticker, start=start_date, end=end_date, progress=False)
+        
+        if vix_data.empty:
+            logger.warning("No VIX data available")
+            return None
+        
+        # 处理 MultiIndex 列名（如果有）
+        if isinstance(vix_data.columns, pd.MultiIndex):
+            vix_data.columns = vix_data.columns.get_level_values(0)
+        
+        # 确保索引是 datetime 类型
+        vix_data.index = pd.to_datetime(vix_data.index)
+        
+        # 重命名列为小写
+        vix_data.columns = [str(col).lower() for col in vix_data.columns]
+        
         logger.info(f"Downloaded VIX data: {len(vix_data)} days")
         return vix_data
     except Exception as e:
         logger.error(f"Error downloading VIX: {e}")
+        return None
+
+
+def download_spy(start_date, end_date):
+    """
+    下载 SPY 数据
+    
+    Args:
+        start_date: 开始日期
+        end_date: 结束日期
+        
+    Returns:
+        DataFrame: SPY 数据
+    """
+    try:
+        spy_ticker = 'SPY'
+        spy_data = yf.download(spy_ticker, start=start_date, end=end_date, progress=False)
+        
+        if spy_data.empty:
+            logger.warning("No SPY data available")
+            return None
+        
+        # 处理 MultiIndex 列名（如果有）
+        if isinstance(spy_data.columns, pd.MultiIndex):
+            spy_data.columns = spy_data.columns.get_level_values(0)
+        
+        # 确保索引是 datetime 类型
+        spy_data.index = pd.to_datetime(spy_data.index)
+        
+        # 重命名列为小写
+        spy_data.columns = [str(col).lower() for col in spy_data.columns]
+        
+        logger.info(f"Downloaded SPY data: {len(spy_data)} days")
+        return spy_data
+    except Exception as e:
+        logger.error(f"Error downloading SPY: {e}")
         return None
 
 
@@ -599,13 +507,17 @@ def run_backtest(
     logger.info("Downloading VIX data...")
     vix_data = download_vix(start_date, end_date)
     
-    # 4. 创建 Cerebro 引擎
+    # 4. 下载 SPY
+    logger.info("Downloading SPY data...")
+    spy_data = download_spy(start_date, end_date)
+    
+    # 5. 创建 Cerebro 引擎
     cerebro = bt.Cerebro()
     
-    # 5. 添加策略
+    # 6. 添加策略
     cerebro.addstrategy(SwingTradingStrategy)
     
-    # 6. 添加数据
+    # 7. 添加股票数据
     for ticker, df in data_dict.items():
         # 数据已经准备好：日期是索引，列名是小写
         data = bt.feeds.PandasData(
@@ -620,39 +532,61 @@ def run_backtest(
         )
         cerebro.adddata(data, name=ticker)
     
-    # 7. 添加 VIX 数据（用于市场环境过滤）
+    # 8. 添加 VIX 数据
     if vix_data is not None and not vix_data.empty:
         vix_feed = bt.feeds.PandasData(
             dataname=vix_data,
             datetime=None,
-            open='Open',
-            high='High',
-            low='Low',
-            close='Close',
-            volume='Volume',
+            open='open',
+            high='high',
+            low='low',
+            close='close',
+            volume='volume',
             openinterest=-1
         )
         cerebro.adddata(vix_feed, name='VIX')
-        cerebro.addstrategy(SwingTradingStrategy, vix_data=vix_feed)
+        logger.info("VIX data feed added to cerebro")
+    else:
+        logger.warning("No VIX data available, proceeding without market filter")
     
-    # 8. 设置佣金（使用自定义佣金类）
+    # 9. 添加 SPY 数据
+    if spy_data is not None and not spy_data.empty:
+        spy_feed = bt.feeds.PandasData(
+            dataname=spy_data,
+            datetime=None,
+            open='open',
+            high='high',
+            low='low',
+            close='close',
+            volume='volume',
+            openinterest=-1
+        )
+        cerebro.adddata(spy_feed, name='SPY')
+        logger.info("SPY data feed added to cerebro")
+    else:
+        logger.warning("No SPY data available, proceeding without market regime filter")
+    
+    # 10. 设置仓位大小（10% of portfolio）
+    cerebro.addsizer(bt.sizers.PercentSizer, percents=10)
+    
+    # 11. 设置佣金（使用自定义佣金类）
     cerebro.broker.addcommissioninfo(IBKRCommission())
     
-    # 9. 设置初始资金
+    # 12. 设置初始资金
     cerebro.broker.setcash(initial_cash)
     
-    # 10. 添加分析器
+    # 13. 添加分析器
     cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe')
     cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
     cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trades')
     
-    # 11. 运行回测
+    # 14. 运行回测
     logger.info("Running backtest...")
     print(f"\nStarting Portfolio Value: ${cerebro.broker.getvalue():,.2f}")
     
     results = cerebro.run()
     
-    # 12. 打印分析器结果
+    # 15. 打印分析器结果
     strat = results[0]
     
     print("\n" + "=" * 60)
@@ -684,7 +618,7 @@ def run_backtest(
                 win_rate = total.get('won', 0) / total['total'] * 100
                 print(f"Win Rate: {win_rate:.2f}%")
     
-    # 13. 绘制结果
+    # 16. 绘制结果
     if plot_results:
         logger.info("Plotting results...")
         cerebro.plot(style='candlestick', barup='green', bardown='red')
