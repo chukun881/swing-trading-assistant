@@ -264,16 +264,23 @@ def scan_market(tickers: List[str], max_signals: int = 5) -> List[Dict]:
 # ============================================================================
 
 def format_signal_message(signal: Dict) -> str:
-    """格式化信号消息"""
+    """格式化信号消息（加入一键看图链接）"""
+    ticker = signal['ticker']
+    tv_url = f"https://www.tradingview.com/chart/?symbol={ticker}"
+    yf_url = f"https://finance.yahoo.com/quote/{ticker}"
+    
     return f"""
-🔥 <b>BUY 信号</b>
+🔥 <b>BUY 信号触发</b>
 
-📈 <b>{signal['ticker']}</b>
-💰 价格: ${signal['price']:.2f}
-📊 RSI: {signal['rsi']:.1f}
+📈 <b>代码: {ticker}</b>
+💰 现价: ${signal['price']:.2f}
+📊 RSI (动能): {signal['rsi']:.1f}
 📅 日期: {signal['date'].strftime('%Y-%m-%d')}
-"""
 
+🔍 <b>一键看图表:</b>
+<a href="{tv_url}">[打开 TradingView]</a>
+<a href="{yf_url}">[打开 Yahoo Finance]</a>
+"""
 
 def send_signals(signals: List[Dict], telegram: TelegramNotifier):
     """发送信号到 Telegram"""
