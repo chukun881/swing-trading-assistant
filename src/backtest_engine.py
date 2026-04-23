@@ -22,10 +22,10 @@ logger = logging.getLogger(__name__)
 
 class SignalPandasData(bt.feeds.PandasData):
     """
-    扩展的 PandasData，包含 Buy_Signal 和 Sell_Signal 列
+    扩展的 PandasData，包含 Buy_Signal, Sell_Signal 和 RSI 列
     """
     # 定义额外的 lines
-    lines = ('Buy_Signal', 'Sell_Signal')
+    lines = ('Buy_Signal', 'Sell_Signal', 'rsi')
     
     # 定义列名映射
     params = (
@@ -38,6 +38,7 @@ class SignalPandasData(bt.feeds.PandasData):
         ('openinterest', None),
         ('Buy_Signal', -1),
         ('Sell_Signal', -1),
+        ('rsi', -1),
     )
 
 
@@ -105,6 +106,28 @@ class SwingTradingStrategy(bt.Strategy):
         
         # 存储所有信号用于排序
         self.buy_signals = []
+        
+        # 订单追踪
+        self.order = None
+    
+    def notify_order(self, order):
+        """订单状态通知"""
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+        self.order = None
+    
+    def notify_trade(self, trade):
+        """交易完成通知"""
+        if not trade.isclosed:
+            return
+        
+        self.trade_count += 1
+        pnl = trade.pnlcomm
+        
+        if pnl > 0:
+            self.winning_trades += 1
+        else:
+            self.losing_trades += 1
     
     def next(self):
         """每个 bar 调用"""
@@ -130,20 +153,25 @@ class SwingTradingStrategy(bt.Strategy):
                 self.check_exit_signals(data, pos)
                 continue
             
-            # 检查买入信号 - Buy_Signal 可能是 True/False 或 0/1
+            # 检查买入信号
             buy_signal = False
             if hasattr(data, 'Buy_Signal'):
                 try:
-                    buy_signal = bool(data.Buy_Signal[0])
+                    val = data.Buy_Signal[0]
+                    buy_signal = bool(val)
                 except:
                     pass
             
             if buy_signal:
-                self.buy_signals.append({
-                    'data': data,
-                    'rsi': getattr(data, 'rsi', [50])[0],
-                    'price': data.close[0],
-                })
+                try:
+                    rsi_val = data.rsi[0]
+                    self.buy_signals.append({
+                        'data': data,
+                        'rsi': rsi_val,
+                        'price': data.close[0],
+                    })
+                except:
+                    pass
         
         # 如果有多个买入信号，按 RSI 排序（最高优先）
         if self.buy_signals:
@@ -204,28 +232,19 @@ class SwingTradingStrategy(bt.Strategy):
         current_price = data.close[0]
         entry_date = self.entry_dates.get(symbol, data.datetime.date(0))
         
-        # 记录交易
-        pnl = (current_price - entry_price) / entry_price
-        
+        # 记录交易详情
         trade_info = {
             'symbol': symbol,
             'entry_date': entry_date,
             'exit_date': data.datetime.date(0),
             'entry_price': entry_price,
             'exit_price': current_price,
-            'pnl_pct': pnl,
+            'pnl_pct': (current_price - entry_price) / entry_price,
             'reason': reason,
         }
         self.trades.append(trade_info)
         
-        # 统计
-        self.trade_count += 1
-        if pnl > 0:
-            self.winning_trades += 1
-        else:
-            self.losing_trades += 1
-        
-        logger.info(f"EXIT {symbol} at ${current_price:.2f}, PnL={pnl*100:+.2f}%, Reason={reason}")
+        logger.info(f"EXIT {symbol} at ${current_price:.2f}, Reason={reason}")
         
         # 平仓
         self.close(data=data)

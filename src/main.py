@@ -1,309 +1,353 @@
 """
-Swing Trading Assistant - 主程序
-整合所有模块，执行市场扫描和信号检测
+Swing Trading Assistant - 实时市场扫描器
+
+职责：
+- 获取 US 股票数据
+- 使用 breakout.py（大脑）计算指标和信号
+- 输出 BUY / HOLD / SELL 建议
+- 通过 Telegram 推送
+
+架构：
+- src/analysis/breakout.py: 唯一的策略大脑
+- 此文件: 数据获取 + Telegram 通知
 """
 import os
 import sys
 import logging
 import time
-import yaml
-from dotenv import load_dotenv
-from datetime import datetime
-from typing import List, Dict
+from datetime import datetime, timedelta
+from typing import List, Dict, Tuple
+import pandas as pd
+import yfinance as yf
 
-# 添加项目根目录到Python路径
+# 添加项目根目录到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.data.tradingview import get_stock_list_with_data
-from src.data.ibkr import create_ibkr_connection
-from src.analysis.indicators import calculate_all_indicators
-from src.analysis.signals import generate_buy_signals, generate_exit_signals, analyze_stock_potential
-from src.notifications.telegram import create_telegram_notifier
+from src.analysis.breakout import add_signals_to_dataframe, calculate_indicators_batch
+from src.notifications.telegram import TelegramNotifier
 
+# ============================================================================
+# 配置和日志
+# ============================================================================
 
-def setup_logging(log_level: str = 'INFO'):
-    """配置日志系统"""
+def setup_logging():
+    """配置日志"""
     log_dir = 'logs'
     os.makedirs(log_dir, exist_ok=True)
     
-    # 创建日志文件名（带日期）
-    log_filename = os.path.join(log_dir, f'trading_assistant_{datetime.now().strftime("%Y%m%d")}.log')
+    log_file = os.path.join(log_dir, f'scanner_{datetime.now().strftime("%Y%m%d")}.log')
     
-    # 配置日志格式
     logging.basicConfig(
-        level=getattr(logging, log_level.upper()),
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler(log_filename),
+            logging.FileHandler(log_file),
             logging.StreamHandler(sys.stdout)
         ]
     )
-    
     return logging.getLogger(__name__)
 
 
-def load_config() -> Dict:
-    """加载配置文件"""
-    logger = logging.getLogger(__name__)
+logger = setup_logging()
+
+# ============================================================================
+# 股票列表
+# ============================================================================
+
+RUSSELL_1000_TICKERS = [
+    'AAPL', 'MSFT', 'GOOGL', 'GOOG', 'AMZN', 'NVDA', 'META', 'BRK.B', 'LLY', 'AVGO',
+    'TSLA', 'JPM', 'XOM', 'V', 'UNH', 'MA', 'JNJ', 'PG', 'COST', 'HD',
+    'MRK', 'ABBV', 'CVX', 'BAC', 'KO', 'PEP', 'WMT', 'AMD', 'NFLX', 'CSCO',
+    'ADBE', 'CRM', 'QCOM', 'WFC', 'ABT', 'PFE', 'ORCL', 'INTC', 'DIS', 'VZ',
+    'TMO', 'DHR', 'NKE', 'MCD', 'IBM', 'ACN', 'GE', 'TXN', 'LLY', 'D',
+    # 添加更多 Russell 1000 股票...
+]
+
+def get_russell_1000() -> List[str]:
+    """
+    获取 Russell 1000 股票列表
     
-    # 加载YAML配置
+    返回: 股票代码列表
+    """
+    # 尝试从维基百科获取
     try:
-        with open('config/config.yaml', 'r') as f:
-            config = yaml.safe_load(f)
-        logger.info("Configuration loaded from config.yaml")
+        import requests
+        from bs4 import BeautifulSoup
+        
+        url = "https://en.wikipedia.org/wiki/Russell_1000_Index"
+        response = requests.get(url, timeout=10)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # 找到包含股票列表的表格
+        table = soup.find('table', {'class': 'wikitable sortable'})
+        if table:
+            tickers = []
+            for row in table.find_all('tr')[1:]:  # 跳过表头
+                cells = row.find_all('td')
+                if cells:
+                    ticker = cells[0].text.strip().replace('.', '-')
+                    if ticker and ticker not in ['Date', 'Ticker']:
+                        tickers.append(ticker)
+            
+            if len(tickers) > 100:  # 确保获取到合理数量
+                logger.info(f"从维基百科获取了 {len(tickers)} 只 Russell 1000 股票")
+                return tickers
     except Exception as e:
-        logger.error(f"Error loading config.yaml: {e}")
-        config = {}
+        logger.warning(f"从维基百科获取股票列表失败: {e}")
     
-    # 加载环境变量
-    load_dotenv('config/.env')
-    
-    # 添加环境变量到配置
-    env_vars = {
-        'TELEGRAM_BOT_TOKEN': os.getenv('TELEGRAM_BOT_TOKEN'),
-        'TELEGRAM_CHAT_ID': os.getenv('TELEGRAM_CHAT_ID'),
-        'IB_HOST': os.getenv('IB_HOST'),
-        'IB_PORT': os.getenv('IB_PORT'),
-        'IB_CLIENT_ID': os.getenv('IB_CLIENT_ID')
-    }
-    
-    config.update(env_vars)
-    logger.info("Environment variables loaded from .env")
-    
-    return config
+    # 回退到硬编码列表
+    logger.info("使用硬编码的股票列表")
+    return RUSSELL_1000_TICKERS
 
 
-def scan_for_signals(config: Dict, telegram_notifier) -> List[Dict]:
+# ============================================================================
+# 数据获取
+# ============================================================================
+
+def download_stock_data(tickers: List[str], days: int = 365) -> Dict[str, pd.DataFrame]:
+    """
+    下载股票数据
+    
+    Args:
+        tickers: 股票代码列表
+        days: 历史天数
+        
+    Returns:
+        {ticker: DataFrame} 字典
+    """
+    end_date = datetime.now().strftime('%Y-%m-%d')
+    start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+    
+    logger.info(f"下载 {len(tickers)} 只股票的数据 ({start_date} 到 {end_date})")
+    
+    data_dict = {}
+    
+    for i, ticker in enumerate(tickers):
+        try:
+            df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+            
+            if df.empty:
+                continue
+            
+            # 处理 MultiIndex columns
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            
+            # 标准化列名
+            df.index = pd.to_datetime(df.index)
+            df.columns = [str(col).lower() for col in df.columns]
+            
+            data_dict[ticker] = df
+            
+            if (i + 1) % 50 == 0:
+                logger.info(f"已下载 {i + 1}/{len(tickers)} 只股票")
+                
+        except Exception as e:
+            logger.debug(f"下载 {ticker} 失败: {e}")
+            continue
+    
+    logger.info(f"成功下载 {len(data_dict)} 只股票的数据")
+    return data_dict
+
+
+def download_market_data() -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    下载市场数据 (SPY 和 VIX)
+    
+    Returns:
+        (spy_df, vix_df)
+    """
+    end_date = datetime.now().strftime('%Y-%m-%d')
+    start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+    
+    logger.info("下载市场数据 (SPY 和 VIX)...")
+    
+    spy_df = yf.download('SPY', start=start_date, end=end_date, progress=False)
+    vix_df = yf.download('^VIX', start=start_date, end=end_date, progress=False)
+    
+    # 标准化
+    for df in [spy_df, vix_df]:
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df.index = pd.to_datetime(df.index)
+        df.columns = [str(col).lower() for col in df.columns]
+    
+    return spy_df, vix_df
+
+
+# ============================================================================
+# 信号扫描
+# ============================================================================
+
+def scan_market(tickers: List[str], max_signals: int = 5) -> List[Dict]:
     """
     扫描市场寻找交易信号
     
     Args:
-        config: 配置字典
-        telegram_notifier: Telegram通知器
+        tickers: 股票代码列表
+        max_signals: 最大返回信号数
         
     Returns:
-        list: 发现的信号列表
+        信号列表
     """
-    logger = logging.getLogger(__name__)
-    signals = []
-    potential_stocks = []
-    
-    logger.info("Starting market scan...")
+    logger.info("=" * 60)
+    logger.info("开始市场扫描")
+    logger.info("=" * 60)
     start_time = time.time()
     
-    # 获取股票数据（仅美国市场）
-    max_stocks = config.get('max_stocks', 300)
-    stocks = get_stock_list_with_data(config, max_stocks=max_stocks)
-    logger.info(f"Retrieved data for {len(stocks)} US stocks")
+    # 下载市场数据
+    spy_df, vix_df = download_market_data()
     
-    # 分析每只股票
-    for stock in stocks:
-        symbol = stock['symbol']
-        df = stock['data']
-        
-        try:
-            # 计算技术指标
-            df_with_indicators = calculate_all_indicators(df, config)
-            
-            # 检测买入信号
-            buy_signal = generate_buy_signals(df_with_indicators, config, symbol)
-            if buy_signal:
-                signals.append(buy_signal)
-                logger.info(f"BUY signal detected for {symbol}")
-                
-                # 立即发送信号
-                telegram_notifier.send_signal(buy_signal)
-            
-            # 分析股票潜力
-            potential = analyze_stock_potential(df_with_indicators, config, symbol)
-            if potential['overall'] == 'MONITOR':
-                potential_stocks.append(potential)
-            
-        except Exception as e:
-            logger.error(f"Error analyzing stock {symbol}: {e}")
+    # 下载股票数据
+    stock_data = download_stock_data(tickers)
+    
+    if not stock_data:
+        logger.error("没有下载到任何股票数据")
+        return []
+    
+    # 计算指标和信号（使用 breakout.py）
+    logger.info("计算技术指标和信号...")
+    stock_data = calculate_indicators_batch(stock_data, spy_df, vix_df)
+    
+    # 分析信号
+    buy_signals = []
+    hold_signals = []
+    sell_signals = []
+    
+    for ticker, df in stock_data.items():
+        if len(df) < 50:  # 需要足够的数据
             continue
+        
+        # 获取最新数据
+        latest = df.iloc[-1]
+        
+        # 检查信号
+        if latest['Buy_Signal'] == 1:
+            buy_signals.append({
+                'ticker': ticker,
+                'price': latest['close'],
+                'rsi': latest['rsi'],
+                'volume': latest['volume'],
+                'date': df.index[-1],
+            })
+        elif latest['Sell_Signal'] == 1:
+            sell_signals.append({
+                'ticker': ticker,
+                'price': latest['close'],
+                'rsi': latest['rsi'],
+                'date': df.index[-1],
+            })
+        else:
+            hold_signals.append({
+                'ticker': ticker,
+                'price': latest['close'],
+                'rsi': latest['rsi'],
+                'date': df.index[-1],
+            })
+    
+    # 按 RSI 排序 BUY 信号（高 RSI 优先）
+    buy_signals.sort(key=lambda x: x['rsi'], reverse=True)
     
     duration = time.time() - start_time
-    logger.info(f"Market scan completed in {duration:.2f} seconds")
+    logger.info(f"扫描完成: {duration:.2f} 秒")
+    logger.info(f"  扫描股票: {len(stock_data)}")
+    logger.info(f"  BUY 信号: {len(buy_signals)}")
+    logger.info(f"  SELL 信号: {len(sell_signals)}")
+    logger.info(f"  HOLD 信号: {len(hold_signals)}")
     
-    # 发送市场扫描报告
-    scan_report = telegram_notifier.format_market_scan_report(
-        stocks_scanned=len(stocks),
-        signals_found=len(signals),
-        duration=duration
-    )
-    telegram_notifier.send_daily_report(scan_report)
-    
-    # 如果有潜力股票，发送报告
-    if potential_stocks:
-        potential_report = telegram_notifier.format_potential_stocks_report(potential_stocks)
-        telegram_notifier.send_daily_report(potential_report)
-    
-    return signals
+    # 返回前 N 个 BUY 信号
+    return buy_signals[:max_signals]
 
 
-def check_exit_signals(config: Dict, ibkr_connection, telegram_notifier) -> List[Dict]:
-    """
-    检查持仓的退出信号
-    
-    Args:
-        config: 配置字典
-        ibkr_connection: IBKR连接对象
-        telegram_notifier: Telegram通知器
-        
-    Returns:
-        list: 退出信号列表
-    """
-    logger = logging.getLogger(__name__)
-    exit_signals = []
-    
-    if not ibkr_connection:
-        logger.warning("IBKR connection not available, skipping exit signal check")
-        return exit_signals
-    
-    try:
-        # 获取持仓
-        positions = ibkr_connection.get_positions()
-        logger.info(f"Checking {len(positions)} positions for exit signals")
-        
-        for position in positions:
-            symbol = position['symbol']
-            quantity = position['quantity']
-            avg_cost = position['avg_cost']
-            
-            # 只检查多头持仓
-            if quantity <= 0:
-                continue
-            
-            try:
-                # 获取股票数据
-                from src.data.tradingview import get_stock_historical_data
-                df = get_stock_historical_data(symbol)
-                
-                if df is None:
-                    logger.warning(f"Could not get data for position {symbol}")
-                    continue
-                
-                # 计算技术指标
-                df_with_indicators = calculate_all_indicators(df, config)
-                
-                # 准备持仓信息
-                position_info = {
-                    'entry_price': avg_cost,
-                    'quantity': quantity
-                }
-                
-                # 检测退出信号
-                exit_signal = generate_exit_signals(df_with_indicators, config, position_info, symbol)
-                if exit_signal:
-                    exit_signals.append(exit_signal)
-                    logger.info(f"Exit signal detected for {symbol}: {exit_signal['signal']}")
-                    
-                    # 立即发送退出信号
-                    telegram_notifier.send_signal(exit_signal)
-                
-            except Exception as e:
-                logger.error(f"Error checking exit signals for {symbol}: {e}")
-                continue
-        
-    except Exception as e:
-        logger.error(f"Error in exit signal check: {e}")
-    
-    return exit_signals
+# ============================================================================
+# Telegram 通知
+# ============================================================================
+
+def format_signal_message(signal: Dict) -> str:
+    """格式化信号消息"""
+    return f"""
+🔥 <b>BUY 信号</b>
+
+📈 <b>{signal['ticker']}</b>
+💰 价格: ${signal['price']:.2f}
+📊 RSI: {signal['rsi']:.1f}
+📅 日期: {signal['date'].strftime('%Y-%m-%d')}
+"""
 
 
-def send_account_report(ibkr_connection, telegram_notifier):
-    """
-    发送账户报告
-    
-    Args:
-        ibkr_connection: IBKR连接对象
-        telegram_notifier: Telegram通知器
-    """
-    logger = logging.getLogger(__name__)
-    
-    if not ibkr_connection:
-        logger.warning("IBKR connection not available, skipping account report")
+def send_signals(signals: List[Dict], telegram: TelegramNotifier):
+    """发送信号到 Telegram"""
+    if not signals:
+        logger.info("没有发现信号")
         return
     
-    try:
-        # 获取账户摘要
-        summary = ibkr_connection.get_account_summary()
-        if summary:
-            summary_text = ibkr_connection.format_account_summary(summary)
-            telegram_notifier.send_account_summary(summary_text)
-        
-        # 获取持仓
-        positions = ibkr_connection.get_positions()
-        if positions:
-            positions_text = ibkr_connection.format_positions(positions)
-            telegram_notifier.send_positions(positions_text)
-        
-    except Exception as e:
-        logger.error(f"Error sending account report: {e}")
+    logger.info(f"发送 {len(signals)} 个信号到 Telegram")
+    
+    for signal in signals:
+        message = format_signal_message(signal)
+        telegram.send_message(message)
+        time.sleep(0.5)  # 避免被限流
 
+
+# ============================================================================
+# 主函数
+# ============================================================================
 
 def main():
     """主函数"""
-    # 设置日志
-    logger = setup_logging()
     logger.info("=" * 60)
-    logger.info("Swing Trading Assistant Started")
+    logger.info("Swing Trading Assistant - 实时扫描器")
     logger.info("=" * 60)
+    logger.info(f"开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
-    # 加载配置
-    config = load_config()
+    # 初始化 Telegram
+    telegram_token = os.getenv('TELEGRAM_BOT_TOKEN')
+    telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')
     
-    # 初始化Telegram通知器
-    telegram_notifier = create_telegram_notifier(config)
-    if not telegram_notifier:
-        logger.error("Failed to initialize Telegram notifier")
+    if not telegram_token or not telegram_chat_id:
+        logger.error("未设置 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 环境变量")
+        logger.info("请在 .env 文件中设置:")
+        logger.info("  TELEGRAM_BOT_TOKEN=your_bot_token")
+        logger.info("  TELEGRAM_CHAT_ID=your_chat_id")
         return
     
-    telegram_notifier.send_success("Swing Trading Assistant started successfully!")
-    
-    # 连接IBKR（可选）
-    ibkr_connection = None
-    try:
-        ibkr_connection = create_ibkr_connection(config)
-        if ibkr_connection:
-            logger.info("IBKR connection established")
-            # 发送账户报告
-            send_account_report(ibkr_connection, telegram_notifier)
-        else:
-            logger.warning("Could not connect to IBKR, continuing without portfolio tracking")
-            telegram_notifier.send_warning("Could not connect to IBKR. Portfolio tracking disabled.")
-    except Exception as e:
-        logger.error(f"Error connecting to IBKR: {e}")
-        telegram_notifier.send_warning(f"IBKR connection error: {e}")
+    telegram = TelegramNotifier(telegram_token, telegram_chat_id)
     
     try:
-        # 扫描市场寻找买入信号
-        buy_signals = scan_for_signals(config, telegram_notifier)
-        logger.info(f"Found {len(buy_signals)} buy signals")
+        # 获取股票列表
+        tickers = get_russell_1000()
+        logger.info(f"扫描 {len(tickers)} 只股票")
         
-        # 如果有IBKR连接，检查退出信号
-        if ibkr_connection:
-            exit_signals = check_exit_signals(config, ibkr_connection, telegram_notifier)
-            logger.info(f"Found {len(exit_signals)} exit signals")
+        # 扫描市场
+        signals = scan_market(tickers)
         
-        logger.info("Swing Trading Assistant completed successfully")
-        telegram_notifier.send_success("Market scan completed successfully!")
+        # 发送信号
+        send_signals(signals, telegram)
+        
+        # 发送总结
+        summary = f"""
+✅ <b>市场扫描完成</b>
+
+📊 扫描结果:
+  • 扫描股票: {len(tickers)}
+  • 发现信号: {len(signals)}
+
+🕐 完成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+        telegram.send_message(summary)
+        
+        logger.info("=" * 60)
+        logger.info("扫描完成")
+        logger.info("=" * 60)
         
     except Exception as e:
-        logger.error(f"Error during execution: {e}", exc_info=True)
-        telegram_notifier.send_error(f"Execution error: {str(e)}")
-    
-    finally:
-        # 断开IBKR连接
-        if ibkr_connection:
-            ibkr_connection.disconnect()
-            logger.info("IBKR connection closed")
-        
-        logger.info("=" * 60)
-        logger.info("Swing Trading Assistant Finished")
-        logger.info("=" * 60)
+        logger.error(f"扫描失败: {e}", exc_info=True)
+        telegram.send_message(f"❌ 扫描失败: {str(e)}")
 
 
 if __name__ == "__main__":
+    # 加载 .env 文件
+    from dotenv import load_dotenv
+    load_dotenv()
+    
     main()
