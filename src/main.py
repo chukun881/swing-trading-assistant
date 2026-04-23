@@ -92,7 +92,8 @@ def scan_for_signals(config: Dict, telegram_notifier) -> List[Dict]:
     start_time = time.time()
     
     # 获取股票数据
-    stocks = get_stock_list_with_data(config, max_stocks_per_market=15)
+    max_stocks = config.get('max_stocks_per_market', 300)
+    stocks = get_stock_list_with_data(config, max_stocks_per_market=max_stocks)
     logger.info(f"Retrieved data for {len(stocks)} stocks")
     
     # 分析每只股票

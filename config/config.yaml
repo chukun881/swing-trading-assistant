@@ -35,3 +35,6 @@ markets:
 
 # 其他配置
 log_level: INFO
+
+# 股票扫描配置
+max_stocks_per_market: 300  # 每个市场扫描的最大股票数量

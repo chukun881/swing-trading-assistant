@@ -7,6 +7,7 @@ from telegram import Bot
 from telegram.error import TelegramError
 from typing import Optional
 import asyncio
+import sys
 
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,20 @@ class TelegramNotifier:
         self.chat_id = chat_id
         self.bot = None
         self._initialized = False
+        self._loop = None
+    
+    def _get_or_create_loop(self):
+        """获取或创建事件循环"""
+        try:
+            # 尝试获取当前事件循环
+            loop = asyncio.get_running_loop()
+            return loop
+        except RuntimeError:
+            # 没有运行中的循环，创建一个新的
+            if self._loop is None or self._loop.is_closed():
+                self._loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(self._loop)
+            return self._loop
     
     def initialize(self) -> bool:
         """
@@ -37,10 +52,17 @@ class TelegramNotifier:
         """
         try:
             self.bot = Bot(token=self.token)
-            # 测试连接
-            asyncio.run(self.bot.get_me())
+            
+            # 使用同步方式测试连接
+            loop = self._get_or_create_loop()
+            
+            async def _get_me():
+                return await self.bot.get_me()
+            
+            result = loop.run_until_complete(_get_me())
+            
             self._initialized = True
-            logger.info("Telegram Bot initialized successfully")
+            logger.info(f"Telegram Bot initialized successfully: {result.username}")
             return True
         except Exception as e:
             logger.error(f"Failed to initialize Telegram Bot: {e}")
@@ -92,17 +114,26 @@ class TelegramNotifier:
             if not self.initialize():
                 return False
         
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+        # 使用现有或创建新的事件循环
+        loop = self._get_or_create_loop()
         
         try:
-            return loop.run_until_complete(self.send_message_async(message, parse_mode))
+            result = loop.run_until_complete(self.send_message_async(message, parse_mode))
+            return result
         except Exception as e:
             logger.error(f"Error in send_message: {e}")
             return False
+        finally:
+            # 不关闭循环，让它可以被重用
+            # 只清理已完成的任务
+            try:
+                pending = asyncio.all_tasks(loop)
+                # 只取消已经完成的任务
+                for task in pending:
+                    if task.done():
+                        task.cancel()
+            except Exception as e:
+                logger.debug(f"Error cleaning up tasks: {e}")
     
     def send_signal(self, signal: dict) -> bool:
         """

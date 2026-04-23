@@ -2,296 +2,419 @@
 
 本文档记录了已知问题及其解决方案。
 
-## ✅ 已修复的问题
+## 📚 目录
 
-### 1. IBKR Position Attribute Error
-
-**问题描述:**
-```
-Error: 'Position' object has no attribute 'marketPrice'
-```
-
-**原因:**
-在 `ib_insync` 库中，`Position` 对象只包含 `contract`、`position` 和 `avgCost` 属性，不包含 `marketPrice()` 方法。
-
-**解决方案:**
-- ✅ 已将 `ib.positions()` 更改为 `ib.portfolio()`
-- ✅ `portfolio()` 返回的对象包含所有市场价值信息
-- ✅ 修改了属性访问方式（从 `marketPrice()` 改为 `marketPrice`）
-
-**修改文件:** `src/data/ibkr.py`
+1. [TradingView API 问题](#tradingview-api-问题)
+2. [yfinance 数据获取问题](#yfinance-数据获取问题)
+3. [Telegram 通知问题](#telegram-通知问题)
+4. [IBKR 连接问题](#ibkr-连接问题)
+5. [性能优化](#性能优化)
 
 ---
 
-### 2. TradingView Screener API Error
+## TradingView API 问题
 
-**问题描述:**
+### 问题 1: TradingView API 返回 "Unknown field" 错误
+
+**错误信息：**
 ```
-Error: 'Column' object has no attribute 'eq'
-```
-
-**原因:**
-`tradingview-screener` 库的 API 可能存在版本不兼容或使用方法不正确的问题。
-
-**解决方案:**
-- ✅ 更新了 Column 方法调用：
-  - `.eq()` → `.equals()`
-  - `.gte()` → `.greater_than()`
-  - `.order_by()` → 添加 `order='desc'` 参数
-- ✅ 添加了备用方案（Fallback）：
-  - 当 TradingView Screener 失败时，自动使用预定义的热门股票列表
-  - 美国：AAPL, MSFT, GOOGL, AMZN, TSLA, META, NVDA, JPM, V, JNJ
-  - 马来西亚：MAYBANK, CIMB, PUBLICBANK, RHBBANK, TENAGA, MAXIM, IOICORP, SIME
-
-**修改文件:** `src/data/tradingview.py`
-
-**日志提示:**
-如果看到 `Using fallback method for US/Malaysia stocks`，说明正在使用备用方案。
-
----
-
-### 3. SSL/LibreSSL Warning (macOS)
-
-**问题描述:**
-```
-NotOpenSSLWarning: The urllib3 package is insecure
+{"totalCount":0,"error":"Unknown field \"market_cap\"","data":null}
 ```
 
-**原因:**
-macOS 系统默认使用 LibreSSL，而 Python 的某些库期望使用 OpenSSL。
+**原因：** TradingView Screener API 不支持 `market_cap` 字段。
 
-**解决方案:**
-- ✅ 在 `requirements.txt` 中添加了特定版本的 `urllib3` 和 `certifi`
-- ✅ 确保使用兼容的 SSL 库版本
+**解决方案：**
+- 从 `.select()` 中移除 `market_cap` 字段
+- 使用支持的字段：`name`, `close`, `volume`, `exchange`, `ticker`
 
-**修改文件:** `requirements.txt`
+**示例：**
+```python
+# ❌ 错误
+query = Query().select('name', 'close', 'volume', 'market_cap', 'exchange')
 
-**额外步骤（如果问题仍然存在）:**
-
-**方法 1: 更新 Python SSL（推荐）**
-```bash
-# 升级 pip
-python -m pip install --upgrade pip
-
-# 重新安装依赖
-pip install --upgrade urllib3 certifi
+# ✅ 正确
+query = Query().select('name', 'close', 'volume', 'exchange')
 ```
 
-**方法 2: 使用 Homebrew 安装 OpenSSL（macOS）**
-```bash
-# 安装 OpenSSL
-brew install openssl
+### 问题 2: TradingView API 返回 "Column object has no attribute" 错误
 
-# 设置环境变量
-export LDFLAGS="-L/opt/homebrew/opt/openssl/lib"
-export CPPFLAGS="-I/opt/homebrew/opt/openssl/include"
-export PATH="/opt/homebrew/opt/openssl/bin:$PATH"
-
-# 重新安装依赖
-pip install --upgrade -r requirements.txt
+**错误信息：**
+```
+'Column' object has no attribute 'equals'
+'Column' object has no attribute 'greater_than'
+'Column' object has no attribute 'is_in'
 ```
 
-**方法 3: 忽略警告（临时方案）**
-```bash
-# 在运行程序时设置环境变量
-export PYTHONWARNINGS="ignore::urllib3.exceptions.NotOpenSSLWarning"
-python src/main.py
+**原因：** 使用了不存在的 Column 方法。
+
+**解决方案：** 使用正确的操作符和方法
+
+**可用的 Column 方法：**
+```python
+# ✅ 正确的用法
+Column('type') == 'stock'                    # 使用 == 操作符
+Column('volume') >= 1000000                  # 使用 >= 操作符
+Column('exchange').isin(['NASDAQ', 'NYSE'])  # 使用 .isin() 方法
+Column('name').like('AAPL')                  # 使用 .like() 方法
+
+# ❌ 错误的用法
+Column('type').equals('stock')               # 方法不存在
+Column('volume').greater_than(1000000)       # 方法不存在
+Column('exchange').is_in(['NASDAQ', 'NYSE']) # 方法不存在
 ```
 
----
+**完整的 Column 方法列表：**
+- `above_pct`, `below_pct`, `between`, `between_pct`
+- `crosses`, `crosses_above`, `crosses_below`
+- `empty`, `has`, `has_none_of`
+- `in_day_range`, `in_month_range`, `in_week_range`, `isin`, `like`
+- `not_between`, `not_between_pct`, `not_empty`, `not_in`, `not_like`
 
-## 🔍 常见问题排查
+### 问题 3: order_by() 参数错误
 
-### 问题: 程序运行但没有检测到任何信号
-
-**可能原因:**
-1. 市场条件不符合策略条件
-2. 策略参数过于严格
-3. 数据获取失败
-
-**排查步骤:**
-```bash
-# 1. 查看日志
-cat logs/trading_assistant_*.log | grep -i "error"
-
-# 2. 检查是否使用了备用方案
-cat logs/trading_assistant_*.log | grep "fallback"
-
-# 3. 查看扫描了多少只股票
-cat logs/trading_assistant_*.log | grep "stocks retrieved"
-
-# 4. 检查是否有数据
-cat logs/trading_assistant_*.log | grep "Retrieved data for"
+**错误信息：**
+```
+order_by() got an unexpected keyword argument 'desc'
 ```
 
-**解决方案:**
-- 如果使用了 fallback，说明 TradingView Screener 不可用，但程序仍在运行
-- 调整 `config/config.yaml` 中的策略参数，使其更宽松
-- 增加 `max_stocks_per_market` 参数值
-- 确保在市场开放时间运行
+**原因：** `order_by()` 方法不支持 `desc` 参数。
 
----
+**解决方案：** 移除 `desc` 参数
+```python
+# ❌ 错误
+query.order_by('volume', desc=True)
 
-### 问题: Telegram 没有收到任何通知
+# ✅ 正确
+query.order_by('volume')
+```
 
-**可能原因:**
-1. Bot Token 或 Chat ID 错误
-2. 网络连接问题
-3. Telegram API 限制
+### 问题 4: 'int' object has no attribute 'get'
 
-**排查步骤:**
-```bash
-# 1. 验证配置
-cat config/.env
+**错误信息：**
+```
+'int' object has no attribute 'get'
+```
 
-# 2. 检查日志中的 Telegram 错误
-cat logs/trading_assistant_*.log | grep -i "telegram"
+**原因：** TradingView API 返回的是 tuple，不是列表。
 
-# 3. 测试 Telegram 连接
-python3 -c "
-from src.notifications.telegram import create_telegram_notifier
-from dotenv import load_dotenv
-import os
-load_dotenv('config/.env')
-config = {
-    'TELEGRAM_BOT_TOKEN': os.getenv('TELEGRAM_BOT_TOKEN'),
-    'TELEGRAM_CHAT_ID': os.getenv('TELEGRAM_CHAT_ID')
-}
-notifier = create_telegram_notifier(config)
-if notifier:
-    notifier.send_success('Test message')
-else:
-    print('Failed to initialize notifier')
-"
+**解决方案：** 正确处理返回值
+```python
+result = query.get_scanner_data()
+
+# ✅ 正确处理
+if isinstance(result, tuple) and len(result) == 2:
+    total, df = result
+    stocks = df.to_dict('records')
+    
+    # 提取纯股票代码（去掉交易所前缀）
+    for stock in stocks:
+        if 'ticker' in stock:
+            ticker = stock['ticker']
+            if ':' in ticker:
+                stock['name'] = ticker.split(':')[1]
+            else:
+                stock['name'] = ticker
 ```
 
 ---
 
-### 问题: IB 连接失败
+## yfinance 数据获取问题
 
-**可能原因:**
-1. TWS 没有运行
-2. API 端口配置错误
-3. 市场关闭时间
-4. 防火墙阻止
+### 问题 1: 马来西亚股票数据获取失败
 
-**排查步骤:**
-```bash
-# 1. 检查 TWS 是否运行（macOS）
-ps aux | grep -i "trader workstation"
-
-# 2. 检查端口是否在监听
-lsof -i :7496
-
-# 3. 查看日志中的 IB 错误
-cat logs/trading_assistant_*.log | grep -i "ibkr\|tws"
+**错误信息：**
+```
+HTTP Error 404: {"quoteSummary":{"result":null,"error":{"code":"Not Found"}}}
 ```
 
-**解决方案:**
-- 确保 TWS 正在运行且已登录
-- 检查 API 端口是否为 7496
-- 确认 "Enable ActiveX and Socket Clients" 已勾选
-- 尝试重启 TWS
+**原因：** 股票代码格式不正确。
 
-**注意:** IB 连接失败不会影响主要功能（市场扫描和信号检测），只是无法获取持仓信息。
+**解决方案：** 使用正确的 yfinance 代码格式
+
+**马来西亚股票代码格式：**
+- ✅ `1155.KL` - Maybank（使用股票代码 + .KL）
+- ✅ `1023.KL` - CIMB
+- ✅ `1295.KL` - Public Bank
+- ❌ `MAYBANK.KL` - 不存在
+- ❌ `CIMB.KL` - 不存在
+
+**如何找到正确的代码：**
+1. 访问 [Yahoo Finance](https://finance.yahoo.com/)
+2. 搜索股票名称（例如：Maybank）
+3. 查看地址栏中的代码（例如：`1155.KL`）
+
+### 问题 2: 美国股票被错误添加 .KL 后缀
+
+**症状：** AAPL 被转换为 AAPL.KL，导致数据获取失败。
+
+**原因：** 简单的字符长度判断无法正确区分美国和马来西亚股票。
+
+**解决方案：** 使用 `market` 参数明确指定市场
+```python
+# 在 get_stock_list_with_data 中
+us_stocks = market_data['us'][:max_stocks_per_market]
+for stock in us_stocks:
+    symbol = stock.get('name', '')
+    df = get_stock_historical_data(symbol, market='US')  # 明确指定市场
+    
+my_stocks = market_data['malaysia'][:max_stocks_per_market]
+for stock in my_stocks:
+    symbol = stock.get('name', '')
+    df = get_stock_historical_data(symbol, market='Malaysia')  # 明确指定市场
+```
+
+### 问题 3: No data found for symbol
+
+**错误信息：**
+```
+$5686.KL: possibly delisted; no data found
+```
+
+**原因：** 股票可能已退市或代码不正确。
+
+**解决方案：**
+1. 验证股票代码是否正确
+2. 在 Yahoo Finance 上搜索股票
+3. 系统会自动跳过这些股票，继续处理其他股票
 
 ---
 
-### 问题: ta-lib 安装失败
+## Telegram 通知问题
 
-**常见错误:**
+### 问题 1: Event loop is closed 错误
+
+**错误信息：**
 ```
-Command errored out with exit status 1: python setup.py egg_info
+RuntimeError: Event loop is closed
 ```
 
-**解决方案:**
+**原因：** 异步事件循环管理不当。
 
-**macOS:**
+**解决方案：** 完整的事件循环管理（已在代码中实现）
+
+**影响：** 这个错误不会影响消息发送，消息最终会成功发送。
+
+### 问题 2: Telegram Bot Token 无效
+
+**错误信息：**
+```
+Telegram API error: Unauthorized
+```
+
+**原因：** Bot Token 不正确或已被撤销。
+
+**解决方案：**
+1. 联系 @BotFather 创建新 bot
+2. 获取新的 Bot Token
+3. 更新 `config/.env` 文件：
 ```bash
-brew install ta-lib
-pip install ta-lib
+TELEGRAM_BOT_TOKEN=your_new_bot_token
 ```
 
-**Ubuntu/Debian:**
+### 问题 3: 找不到 Chat ID
+
+**症状：** 消息无法发送，提示 chat_id 无效。
+
+**解决方案：**
+
+**方法 1: 使用 API 获取**
 ```bash
-sudo apt-get install build-essential
-wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz
-tar -xzf ta-lib-0.4.0-src.tar.gz
-cd ta-lib/
-./configure --prefix=/usr
-make
-sudo make install
-cd ..
-rm -rf ta-lib ta-lib-0.4.0-src.tar.gz
-pip install ta-lib
+# 替换 YOUR_BOT_TOKEN
+curl https://api.telegram.org/botYOUR_BOT_TOKEN/getUpdates
 ```
 
-**Windows:**
-从 [LFD.uci.edu](https://www.lfd.uci.edu/~gohlke/pythonlibs/#ta-lib) 下载对应 Python 版本的 `.whl` 文件：
+**方法 2: 使用 Python 脚本**
+```python
+import requests
+
+token = "YOUR_BOT_TOKEN"
+url = f"https://api.telegram.org/bot{token}/getUpdates"
+response = requests.get(url)
+print(response.json())
+```
+
+**方法 3: 发送消息后查看日志**
 ```bash
-pip install TA_Lib‑0.4.26‑cp39‑cp39‑win_amd64.whl
+# 运行程序，在日志中查找 chat_id
+python3 src/main.py
 ```
 
 ---
 
-## 📊 性能优化建议
+## IBKR 连接问题
 
-### 1. 减少扫描时间
+### 问题 1: 无法连接到 IB TWS
 
-如果程序运行时间过长：
-
-```yaml
-# 在 config/config.yaml 中减少扫描数量
-# 或者修改 src/main.py 中的 max_stocks_per_market 参数
+**错误信息：**
+```
+Failed to connect to IB TWS: Event loop is closed
 ```
 
-### 2. 调整请求延迟
+**原因：** IB TWS 客户端未运行或 API 未启用。
 
-如果遇到 API 限制：
+**解决方案：**
+
+1. **启动 TWS 客户端**
+   - 打开 Interactive Brokers TWS 应用
+   - 登录您的账户
+
+2. **启用 API**
+   - File → Global Configuration → API → Settings
+   - 勾选 "Enable ActiveX and Socket Clients"
+   - 设置 Socket Port（默认 7496）
+   - 勾选 "Allow connections from localhost"
+
+3. **更新配置**
+   ```bash
+   # config/.env
+   IB_HOST=127.0.0.1
+   IB_PORT=7496
+   IB_CLIENT_ID=1
+   ```
+
+**注意：** 即使 IBKR 连接失败，程序仍会继续运行并扫描市场。
+
+### 问题 2: RuntimeWarning: coroutine was never awaited
+
+**错误信息：**
+```
+RuntimeWarning: coroutine 'IB.connectAsync' was never awaited
+```
+
+**原因：** IBKR 异步连接方法未正确处理。
+
+**影响：** 仅影响 IBKR 连接，不影响其他功能。
+
+---
+
+## 性能优化
+
+### 问题 1: 扫描速度较慢
+
+**症状：** 扫描 150 只股票需要 30 秒以上。
+
+**解决方案：**
+
+1. **减少扫描股票数量**
+   ```yaml
+   # config/config.yaml
+   markets:
+     us:
+       max_stocks: 50  # 减少从 100 到 50
+     malaysia:
+       max_stocks: 25  # 减少从 50 到 25
+   ```
+
+2. **增加最小成交量过滤**
+   ```yaml
+   markets:
+     us:
+       min_volume: 5000000  # 增加从 1M 到 5M
+     malaysia:
+       min_volume: 2000000  # 增加从 500K 到 2M
+   ```
+
+3. **使用并发请求（未来改进）**
+   - 实现并发数据获取
+   - 预计可将扫描时间减少到 10 秒以内
+
+### 问题 2: 频繁的 API 请求被限制
+
+**症状：** 偶尔出现 429 Too Many Requests 错误。
+
+**解决方案：**
+- 代码已添加延迟（每个请求 0.5 秒）
+- 如果仍然遇到限制，增加延迟时间：
+  ```python
+  # src/data/tradingview.py
+  time.sleep(1.0)  # 从 0.5 增加到 1.0
+  ```
+
+---
+
+## 调试技巧
+
+### 1. 启用 DEBUG 日志
 
 ```python
-# 在 src/data/tradingview.py 中调整延迟
-time.sleep(0.5)  # 增加到 1.0 或 2.0
+# src/main.py
+def setup_logging(log_level: str = 'DEBUG'):  # 改为 DEBUG
 ```
 
-### 3. 使用缓存
+### 2. 测试 TradingView API
 
-考虑添加数据缓存功能以减少重复请求。
+```bash
+# 运行测试脚本
+python3 test_tradingview_api.py
+```
+
+### 3. 测试数据获取
+
+```python
+# 临时测试脚本
+from src.data.tradingview import get_stock_historical_data
+
+df = get_stock_historical_data('AAPL', market='US')
+print(df.head())
+
+df = get_stock_historical_data('1155.KL', market='Malaysia')
+print(df.head())
+```
+
+### 4. 检查配置
+
+```bash
+# 查看配置文件
+cat config/config.yaml
+cat config/.env
+```
 
 ---
 
-## 🆘 获取帮助
+## 常见问题解答
 
-如果以上方法都无法解决问题：
+### Q: TradingView API 是免费的吗？
 
-1. **查看完整日志:**
-   ```bash
-   tail -100 logs/trading_assistant_$(date +%Y%m%d).log
-   ```
+A: 是的，TradingView Screener API 是免费的，但有速率限制。
 
-2. **检查系统环境:**
-   ```bash
-   python --version
-   pip --version
-   pip list | grep -E "tradingview|ib_insync|yfinance|ta-lib"
-   ```
+### Q: yfinance API 是免费的吗？
 
-3. **提交 Issue:**
-   - 提供错误日志
-   - 说明操作系统和 Python 版本
-   - 描述复现步骤
+A: 是的，yfinance 是开源免费的，但请遵守 Yahoo Finance 的服务条款。
+
+### Q: 如何获取更多股票？
+
+A: 调整配置文件中的 `max_stocks` 和 `min_volume` 参数。
+
+### Q: 如何添加新的市场？
+
+A: 需要修改 `src/data/tradingview.py` 添加新的市场扫描函数。
+
+### Q: IBKR 是必需的吗？
+
+A: 不是必需的。如果没有 IBKR 账户，程序仍会扫描市场并发送信号。
+
+---
+
+## 获取帮助
+
+如果以上解决方案无法解决您的问题：
+
+1. 查看日志文件：`logs/trading_assistant_YYYYMMDD.log`
+2. 运行测试脚本验证各个模块
+3. 提交 Issue 到 GitHub 仓库
 
 ---
 
 ## 📝 更新日志
 
 ### 2026-04-23
-- ✅ 修复 IBKR Position attribute error
-- ✅ 修复 TradingView Screener API error
-- ✅ 添加 TradingView 数据获取的备用方案
-- ✅ 修复 SSL/LibreSSL 警告
-- ✅ 更新依赖版本
+- ✅ 修复 TradingView Screener API 调用语法
+- ✅ 修复 TradingView API 返回的 tuple 数据结构
+- ✅ 修复股票代码后缀逻辑（添加 market 参数）
+- ✅ 修复马来西亚股票代码格式
+- ✅ 修复 Telegram 异步事件循环问题
+- ✅ 成功实现动态市场扫描（100 US + 50 MY 股票）
 
 ---
 
-**最后更新:** 2026-04-23
+**最后更新：** 2026-04-23
