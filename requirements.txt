@@ -20,6 +20,11 @@ pyyaml>=6.0
 # 日志
 colorlog>=6.8.0
 
+# 回测引擎
+backtrader>=1.9.78.123
+matplotlib>=3.7.0
+scipy>=1.11.0
+
 # 工具库
 requests>=2.31.0
 
